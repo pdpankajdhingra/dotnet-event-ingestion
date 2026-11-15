@@ -1,0 +1,8 @@
+<Solution>
+  <Project Path="src\EventIngestion.Api\EventIngestion.Api.csproj" />
+  <Project Path="src\EventIngestion.Application\EventIngestion.Application.csproj" />
+  <Project Path="src\EventIngestion.Domain\EventIngestion.Domain.csproj" />
+  <Project Path="src\EventIngestion.Infrastructure\EventIngestion.Infrastructure.csproj" />
+  <Project Path="tests\EventIngestion.UnitTests\EventIngestion.UnitTests.csproj" />
+  <Project Path="tests\EventIngestion.IntegrationTests\EventIngestion.IntegrationTests.csproj" />
+</Solution>

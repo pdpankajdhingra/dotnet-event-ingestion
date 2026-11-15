@@ -1,3 +1,4 @@
+using System.Text;
 using System.Text.Json;
 using EventIngestion.Domain.Events;
 using EventIngestion.Infrastructure.Messaging.RabbitMQ;
@@ -35,37 +36,48 @@ public sealed class RabbitMqEventPublisherIntegrationTests
         await using var connection = await factory.CreateConnectionAsync();
         await using var channel = await connection.CreateChannelAsync();
         await channel.ExchangeDeclareAsync(exchangeName, "topic", durable: true, autoDelete: false);
-        await channel.QueueDeclareAsync(queueName, durable: false, exclusive: true, autoDelete: true);
-        await channel.QueueBindAsync(queueName, exchangeName, routingKey);
-
-        await using var publisher = new RabbitMqEventPublisher(Options.Create(settings));
-        using var payloadDocument = JsonDocument.Parse("{\"deviceId\":\"rabbit-it-device\"}");
-        var message = new EventEnvelope
+        try
         {
-            MessageId = Guid.NewGuid().ToString("N"),
-            EventName = "DeviceRegistered",
-            TenantId = "rabbit-it-tenant",
-            CorrelationId = Guid.NewGuid().ToString("N"),
-            OccurredAtUtc = DateTimeOffset.UtcNow,
-            Payload = payloadDocument.RootElement.Clone()
-        };
+            await channel.QueueDeclareAsync(queueName, durable: false, exclusive: true, autoDelete: true);
+            await channel.QueueBindAsync(queueName, exchangeName, routingKey);
 
-        await publisher.PublishAsync(message, CancellationToken.None);
+            await using var publisher = new RabbitMqEventPublisher(Options.Create(settings));
+            using var payloadDocument = JsonDocument.Parse("{\"deviceId\":\"rabbit-it-device\"}");
+            var message = new EventEnvelope
+            {
+                MessageId = Guid.NewGuid().ToString("N"),
+                EventName = "DeviceRegistered",
+                TenantId = "rabbit-it-tenant",
+                CorrelationId = Guid.NewGuid().ToString("N"),
+                OccurredAtUtc = DateTimeOffset.UtcNow,
+                Payload = payloadDocument.RootElement.Clone()
+            };
 
-        var received = await channel.BasicGetAsync(queueName, autoAck: true);
-        Assert.NotNull(received);
-        Assert.Equal(message.MessageId, received.BasicProperties.MessageId);
-        Assert.Equal(message.CorrelationId, received.BasicProperties.CorrelationId);
-        Assert.Equal(message.EventName, received.BasicProperties.Type);
-        Assert.True(received.BasicProperties.Persistent);
-        Assert.Equal("rabbit-it-tenant", received.BasicProperties.Headers!["tenantId"] as string);
+            await publisher.PublishAsync(message, CancellationToken.None);
 
-        var publishedEnvelope = JsonSerializer.Deserialize<EventEnvelope>(received.Body.Span);
-        Assert.NotNull(publishedEnvelope);
-        Assert.Equal(message.MessageId, publishedEnvelope.MessageId);
-        Assert.Equal(message.EventName, publishedEnvelope.EventName);
-        Assert.Equal("rabbit-it-tenant", publishedEnvelope.TenantId);
-        Assert.Equal("rabbit-it-device", publishedEnvelope.Payload.GetProperty("deviceId").GetString());
+            var received = await channel.BasicGetAsync(queueName, autoAck: true);
+            Assert.NotNull(received);
+            Assert.Equal(message.MessageId, received.BasicProperties.MessageId);
+            Assert.Equal(message.CorrelationId, received.BasicProperties.CorrelationId);
+            Assert.Equal(message.EventName, received.BasicProperties.Type);
+            Assert.Equal("application/json", received.BasicProperties.ContentType);
+            Assert.True(received.BasicProperties.Persistent);
+            Assert.NotNull(received.BasicProperties.Headers);
+            Assert.Equal(message.TenantId, Encoding.UTF8.GetString(Assert.IsType<byte[]>(received.BasicProperties.Headers["tenantId"])));
+            Assert.Equal(message.OccurredAtUtc.Value.ToUniversalTime().ToString("O"),
+                Encoding.UTF8.GetString(Assert.IsType<byte[]>(received.BasicProperties.Headers["occurredAtUtc"])));
+
+            var publishedEnvelope = JsonSerializer.Deserialize<EventEnvelope>(received.Body.Span, new JsonSerializerOptions(JsonSerializerDefaults.Web));
+            Assert.NotNull(publishedEnvelope);
+            Assert.Equal(message.MessageId, publishedEnvelope.MessageId);
+            Assert.Equal(message.EventName, publishedEnvelope.EventName);
+            Assert.Equal(message.TenantId, publishedEnvelope.TenantId);
+            Assert.Equal("rabbit-it-device", publishedEnvelope.Payload.GetProperty("deviceId").GetString());
+        }
+        finally
+        {
+            await channel.ExchangeDeleteAsync(exchangeName);
+        }
     }
 
     private static RabbitMqOptions ReadOptions()

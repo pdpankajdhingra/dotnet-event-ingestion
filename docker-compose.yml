@@ -1,4 +1,23 @@
 services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: event-ingestion-api:local
+    environment:
+      ASPNETCORE_URLS: http://+:8080
+      Messaging__Provider: RabbitMQ
+      Messaging__RabbitMQ__HostName: rabbitmq
+      Messaging__RabbitMQ__Port: 5672
+      Messaging__RabbitMQ__UserName: ${RABBITMQ_DEFAULT_USER:-eventing}
+      Messaging__RabbitMQ__Password: ${RABBITMQ_DEFAULT_PASS:-local-development-only}
+      Messaging__RabbitMQ__UseTls: "false"
+    ports:
+      - "127.0.0.1:8080:8080"
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+
   rabbitmq:
     image: rabbitmq:4-management
     container_name: event-ingestion-rabbitmq

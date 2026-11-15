@@ -77,7 +77,39 @@ NuGet package versions are centrally managed in `Directory.Packages.props`. Add 
 
 The default test run does not require either broker. Broker-adapter integration tests are opt-in through environment variables; skipped tests are reported by xUnit when configuration is absent.
 
-## Local RabbitMQ
+## Run the API and RabbitMQ in containers
+
+With Docker Desktop or Docker Engine running, from the repository root:
+
+```powershell
+docker compose up --build -d
+docker compose ps
+Invoke-RestMethod 'http://localhost:8080/health/live'
+Invoke-RestMethod 'http://localhost:8080/health/ready'
+```
+
+Compose builds `event-ingestion-api:local` using the root Dockerfile and starts it after RabbitMQ reports healthy. The API connects to the `rabbitmq` service over the Compose network; port 8080, AMQP, and the RabbitMQ management UI are exposed on loopback only. The multi-stage image uses .NET 10 SDK and ASP.NET Core runtime images and runs the API as a non-root user. HTTP and the default credentials are for local development only; production deployments need TLS and securely supplied credentials.
+
+The readiness check verifies broker connectivity; it does not publish an event. To exercise publishing against the local broker, run the opt-in RabbitMQ adapter integration test described below. An unauthenticated `POST http://localhost:8080/api/events` should return `401`: production authentication is not yet configured, so the containerized API cannot accept authenticated ingestion requests until a trusted authentication scheme is added. Do not use a test-only authentication bypass in production.
+
+To check the unauthenticated response in PowerShell 7:
+
+```powershell
+$body = @{ eventName = 'DeviceRegistered'; tenantId = 'tenant-123'; payload = @{ deviceId = 'test' } } | ConvertTo-Json
+$response = Invoke-WebRequest 'http://localhost:8080/api/events' -Method Post -ContentType 'application/json' -Body $body -SkipHttpErrorCheck
+$response.StatusCode # 401
+```
+
+View logs and stop the containers with:
+
+```powershell
+docker compose logs api rabbitmq
+docker compose down
+```
+
+The named RabbitMQ volume survives `down`. RabbitMQ initializes its default user only on a fresh data volume; changing `RABBITMQ_DEFAULT_USER` or `RABBITMQ_DEFAULT_PASS` later does not update an existing user. Manage users in RabbitMQ or, if the data can be discarded, recreate the volume deliberately with `docker compose down -v` and start again.
+
+## Local RabbitMQ without the API container
 
 Start RabbitMQ with the management plugin:
 

@@ -1,0 +1,12 @@
+.git
+.vs
+**/bin
+**/obj
+**/*.user
+**/*.suo
+**/secrets.json
+.env
+.env.*
+**/*.env
+**/appsettings.Production.json
+TestResults

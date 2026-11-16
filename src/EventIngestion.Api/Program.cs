@@ -1,3 +1,4 @@
+using EventIngestion.Api.Authentication;
 using EventIngestion.Application.Events;
 using EventIngestion.Infrastructure.Messaging;
 using Microsoft.AspNetCore.Diagnostics.HealthChecks;
@@ -10,7 +11,7 @@ var builder = WebApplication.CreateBuilder(args);
 builder.Services.AddControllers();
 builder.Services.AddOpenApi();
 builder.Services.AddProblemDetails();
-builder.Services.AddAuthentication();
+builder.Services.AddEntraAuthentication(builder.Configuration);
 builder.Services.AddAuthorization();
 builder.Services.AddMessaging(builder.Configuration);
 builder.Services.AddHealthChecks()
@@ -48,7 +49,10 @@ if (app.Environment.IsDevelopment())
     app.MapOpenApi();
 }
 
-app.UseHttpsRedirection();
+if (builder.Configuration.GetValue("Http:RedirectToHttps", true))
+{
+    app.UseHttpsRedirection();
+}
 app.UseAuthentication();
 app.UseAuthorization();
 app.MapControllers();

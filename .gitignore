@@ -359,5 +359,12 @@ MigrationBackup/
 # Ionide (cross platform F# VS Code tools) working folder
 .ionide/
 
+# Terraform state, plans and local provider cache may contain sensitive data.
+.terraform/
+*.tfstate*
+*.tfplan
+*.tfvars
+*.tfvars.json
+
 # Fody - auto-generated XML schema
 FodyWeavers.xsd

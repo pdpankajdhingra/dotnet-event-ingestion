@@ -1,0 +1,128 @@
+trigger: none
+pr: none
+
+parameters:
+  - name: apply
+    displayName: Apply reviewed plan after approval
+    type: boolean
+    default: false
+
+pool:
+  vmImage: ubuntu-latest
+
+stages:
+  - stage: Plan
+    jobs:
+      - job: TerraformPlan
+        steps:
+          - checkout: self
+          - bash: bash scripts/InstallTerraform.sh
+            displayName: Install pinned Terraform
+          - task: AzureCLI@2
+            displayName: Validate and plan Terraform
+            inputs:
+              azureSubscription: $(INFRA_SERVICE_CONNECTION)
+              scriptType: bash
+              scriptLocation: inlineScript
+              addSpnToEnvironment: true
+              inlineScript: |
+                set -euo pipefail
+                test -n "${idToken:-}" || { echo 'A workload identity federated service connection is required.' >&2; exit 1; }
+                export ARM_USE_OIDC=true ARM_USE_AZUREAD=true
+                export ARM_CLIENT_ID="$servicePrincipalId" ARM_TENANT_ID="$tenantId"
+                export ARM_ADO_PIPELINE_SERVICE_CONNECTION_ID="$AZURESUBSCRIPTION_SERVICE_CONNECTION_ID"
+                export ARM_OIDC_AZURE_SERVICE_CONNECTION_ID="$AZURESUBSCRIPTION_SERVICE_CONNECTION_ID"
+                export ARM_SUBSCRIPTION_ID="$(az account show --query id -o tsv)"
+                export TF_VAR_subscription_id="$ARM_SUBSCRIPTION_ID"
+                export TF_VAR_location="$LOCATION" TF_VAR_name_prefix="$NAME_PREFIX"
+                export TF_VAR_deployment_principal_id="$DEPLOYMENT_PRINCIPAL_ID"
+                export TF_VAR_monthly_budget_amount="$BUDGET_AMOUNT" TF_VAR_budget_start_date="$BUDGET_START_DATE" TF_VAR_budget_alert_email="$BUDGET_ALERT_EMAIL"
+                test -n "$TF_APPROVERS" && [[ "$TF_APPROVERS" != *'$('* ]] || { echo 'Set TF_APPROVERS to the authorized reviewer.' >&2; exit 1; }
+                terraform -chdir=infrastructure/terraform fmt -check -recursive
+                terraform -chdir=infrastructure/terraform init -input=false -lockfile=readonly \
+                  -backend-config="resource_group_name=$STATE_RESOURCE_GROUP" \
+                  -backend-config="storage_account_name=$STATE_STORAGE_ACCOUNT" \
+                  -backend-config="container_name=$STATE_CONTAINER" \
+                  -backend-config="key=$STATE_KEY" \
+                  -backend-config="use_oidc=true" -backend-config="use_azuread_auth=true"
+                terraform -chdir=infrastructure/terraform validate
+                mkdir -p "$PLAN_DIR"
+                terraform -chdir=infrastructure/terraform plan -input=false -out="$PLAN_DIR/plan.bin"
+                terraform -chdir=infrastructure/terraform show -no-color "$PLAN_DIR/plan.bin" > "$PLAN_DIR/plan.txt"
+            env:
+              LOCATION: $(LOCATION)
+              NAME_PREFIX: $(NAME_PREFIX)
+              DEPLOYMENT_PRINCIPAL_ID: $(DEPLOYMENT_PRINCIPAL_ID)
+              BUDGET_AMOUNT: $(BUDGET_AMOUNT)
+              BUDGET_START_DATE: $(BUDGET_START_DATE)
+              BUDGET_ALERT_EMAIL: $(BUDGET_ALERT_EMAIL)
+              TF_APPROVERS: $(TF_APPROVERS)
+              SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+              STATE_RESOURCE_GROUP: $(STATE_RESOURCE_GROUP)
+              STATE_STORAGE_ACCOUNT: $(STATE_STORAGE_ACCOUNT)
+              STATE_CONTAINER: $(STATE_CONTAINER)
+              STATE_KEY: $(STATE_KEY)
+              PLAN_DIR: $(Build.ArtifactStagingDirectory)/tfplan
+          - publish: $(Build.ArtifactStagingDirectory)/tfplan
+            artifact: tfplan
+            displayName: Publish plan for review
+
+  - ${{ if eq(parameters.apply, true) }}:
+    - stage: Approve
+      dependsOn: Plan
+      jobs:
+        - job: ManualApproval
+          pool: server
+          timeoutInMinutes: 1445
+          steps:
+            - task: ManualValidation@1
+              timeoutInMinutes: 1440
+              inputs:
+                notifyUsers: $(TF_APPROVERS)
+                approvers: $(TF_APPROVERS)
+                allowApproversToApproveTheirOwnRuns: true
+                instructions: Review plan.txt, its costs, target subscription, and the saved plan artifact. Approve only if you explicitly authorize this apply.
+                onTimeout: reject
+    - stage: Apply
+      dependsOn: Approve
+      jobs:
+        - job: TerraformApply
+          steps:
+            - checkout: self
+            - bash: bash scripts/InstallTerraform.sh
+              displayName: Install pinned Terraform
+            - download: current
+              artifact: tfplan
+            - task: AzureCLI@2
+              displayName: Apply the approved saved plan
+              inputs:
+                azureSubscription: $(INFRA_SERVICE_CONNECTION)
+                scriptType: bash
+                scriptLocation: inlineScript
+                addSpnToEnvironment: true
+                inlineScript: |
+                  set -euo pipefail
+                  test -n "${idToken:-}" || { echo 'A workload identity federated service connection is required.' >&2; exit 1; }
+                  export ARM_USE_OIDC=true ARM_USE_AZUREAD=true
+                  export ARM_CLIENT_ID="$servicePrincipalId" ARM_TENANT_ID="$tenantId"
+                  export ARM_ADO_PIPELINE_SERVICE_CONNECTION_ID="$AZURESUBSCRIPTION_SERVICE_CONNECTION_ID"
+                  export ARM_OIDC_AZURE_SERVICE_CONNECTION_ID="$AZURESUBSCRIPTION_SERVICE_CONNECTION_ID"
+                  export ARM_SUBSCRIPTION_ID="$(az account show --query id -o tsv)"
+                  terraform -chdir=infrastructure/terraform init -input=false -lockfile=readonly \
+                    -backend-config="resource_group_name=$STATE_RESOURCE_GROUP" \
+                    -backend-config="storage_account_name=$STATE_STORAGE_ACCOUNT" \
+                    -backend-config="container_name=$STATE_CONTAINER" \
+                    -backend-config="key=$STATE_KEY" \
+                    -backend-config="use_oidc=true" -backend-config="use_azuread_auth=true"
+                  terraform -chdir=infrastructure/terraform apply -input=false "$PLAN_DIR/plan.bin"
+                  terraform -chdir=infrastructure/terraform output -json > "$OUTPUT_DIR/outputs.json"
+              env:
+                SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+                STATE_RESOURCE_GROUP: $(STATE_RESOURCE_GROUP)
+                STATE_STORAGE_ACCOUNT: $(STATE_STORAGE_ACCOUNT)
+                STATE_CONTAINER: $(STATE_CONTAINER)
+                STATE_KEY: $(STATE_KEY)
+                PLAN_DIR: $(Pipeline.Workspace)/tfplan
+                OUTPUT_DIR: $(Build.ArtifactStagingDirectory)
+            - publish: $(Build.ArtifactStagingDirectory)/outputs.json
+              artifact: infrastructure-outputs

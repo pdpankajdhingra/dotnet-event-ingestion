@@ -90,7 +90,7 @@ Invoke-RestMethod 'http://localhost:8080/health/ready'
 
 Compose builds `event-ingestion-api:local` using the root Dockerfile and starts it after RabbitMQ reports healthy. The API connects to the `rabbitmq` service over the Compose network; port 8080, AMQP, and the RabbitMQ management UI are exposed on loopback only. The multi-stage image uses .NET 10 SDK and ASP.NET Core runtime images and runs the API as a non-root user. HTTP and the default credentials are for local development only; production deployments need TLS and securely supplied credentials.
 
-The readiness check verifies broker connectivity; it does not publish an event. To exercise publishing against the local broker, run the opt-in RabbitMQ adapter integration test described below. An unauthenticated `POST http://localhost:8080/api/events` should return `401`: production authentication is not yet configured, so the containerized API cannot accept authenticated ingestion requests until a trusted authentication scheme is added. Do not use a test-only authentication bypass in production.
+The readiness check verifies broker connectivity; it does not publish an event. To exercise publishing against the local broker, run the opt-in RabbitMQ adapter integration test described below. An unauthenticated `POST http://localhost:8080/api/events` returns `401`. To accept authenticated ingestion requests, configure the Entra settings described below; do not use a test-only authentication bypass in production.
 
 To check the unauthenticated response in PowerShell 7:
 
@@ -196,7 +196,11 @@ On completion of the selected adapter's send operation, the API returns `202 Acc
 }
 ```
 
-**Authentication integration is not yet configured in this sample.** The API intentionally fails closed if no authentication scheme produces an authenticated principal and trusted `tenant_id` claim. Before using the endpoint, register the deployment's validated JWT/OIDC or other trusted authentication scheme; do not treat a caller-controlled header as a tenant claim. The integration tests use a test-only authentication handler and do not provide production authentication.
+### Single-tenant Microsoft Entra authentication
+
+Set `Entra__TenantId` to the directory ID and `Entra__ClientId` to the API app registration's client ID. Both must be GUIDs; supplying only one prevents startup. Without either setting, no production authentication scheme is enabled and ingestion fails closed. Configure the API registration to issue v2 access tokens, expose the delegated scope `Event.Ingest` and/or an application role named `Event.Ingest`, and grant the chosen permission to authorized client applications. For application roles, configure the API registration's optional **access token** claim `idtyp`; the API requires `idtyp=app`. Admin consent may be required.
+
+The API validates the token signature, v2 issuer, audience, lifetime, tenant (`tid`), and either the `Event.Ingest` delegated scope or the role on an app-only access token. It derives its trusted `tenant_id` from the validated Entra directory ID, ignoring any token-supplied `tenant_id`. Thus this deployment uses **one Entra directory as its event tenant**, not a separate tenant per customer. A caller-supplied envelope tenant, if present, must equal that directory ID. Test-only authentication handlers are never registered by the production application.
 
 ## Health, tracing, and metrics
 
@@ -206,6 +210,63 @@ On completion of the selected adapter's send operation, the API returns `202 Acc
 - Set `OTEL_EXPORTER_OTLP_ENDPOINT` to enable OTLP export. Without it, the application runs without an OTLP exporter.
 
 The readiness probe creates/checks provider resources without sending an event. Health endpoints should be restricted or handled according to the hosting environment's network and information-disclosure policy.
+
+## Azure test deployment
+
+Terraform in `infrastructure/terraform` provisions a resource group, Basic ACR, a one-node AKS cluster on the Free control-plane tier, Standard Service Bus with an `events` topic and `test` subscription, Key Vault, Log Analytics, a subscription budget, and scoped managed-identity role assignments. The AKS kubelet can pull images; the application workload identity can send to the topic and read Key Vault secrets. Local Service Bus key authentication and AKS local admin accounts are disabled. The AKS Secrets Store CSI add-on is enabled; `k8s/secret-provider-class.yaml` is an optional template, not mounted or deployed until a real secret is needed.
+
+**This is not free or production-ready.** Service Bus Standard has a base charge. Nodes, disks (including the TLS certificate volume), ACR, public IP/load balancing, logs, state storage and other resources can incur charges even with little traffic. Estimate costs for the selected subscription and region first. The subscription-wide budget includes the AKS-managed resource group but is an alert, not a spending limit. Key Vault purge protection means its name remains unavailable during the retention period even after deletion. Stopping AKS does not stop all other charges.
+
+### Prerequisites and bootstrap
+
+1. Use a dedicated test subscription and verify region, resource provider registrations, AKS VM quota, and pricing. Push this repository to Azure Repos and create an Azure DevOps project.
+2. Before running Terraform, separately create a private Azure Storage account and blob container for state, ideally in a separate resource group. Disable shared-key access, use Entra authentication, and grant the infrastructure pipeline identity **Storage Blob Data Contributor** on the container. Restrict state, plan artifacts and pipeline access: plans and state can contain sensitive values. The bootstrap storage is not managed or deleted by this Terraform configuration.
+3. Create two Azure Resource Manager service connections using workload identity federation. Give the infrastructure identity subscription permissions sufficient to create resources, budgets, and role assignments (Contributor alone cannot create role assignments), plus state-container access. Record the **object ID** of the separate application service principal. Terraform grants that principal `AcrPush` and `Reader` on ACR, plus AKS Cluster User and AKS RBAC Cluster Admin on this test cluster. Cluster Admin is required here for automated namespace creation and is broad; restrict the service connection and move to namespace-scoped deployment permissions after bootstrapping for stronger isolation.
+4. Register a **single-tenant** Entra API application. In its manifest set `requestedAccessTokenVersion` to `2`. Under Expose an API set an application ID URI such as `api://<api-client-id>` and create delegated scope `Event.Ingest`; optionally create the `Event.Ingest` app role for application clients. To use the app role, add `idtyp` as an optional **access token** claim on the API registration. Register a separate client, grant the API permission and consent it. For app-only testing, assign the application role and use an appropriate client credential or federation; for delegated testing, request the delegated scope. A token for Microsoft Graph or an ID token is not an API access token. Keep client credentials out of Terraform, manifests and source control.
+5. Create both YAML pipelines. Restrict who may edit pipelines, queue runs, access service connections and approve infrastructure changes; protect the deployment branch and service connections with Azure DevOps checks. The repository YAML approval alone is not a security boundary against someone who can modify the pipeline. Configure the infrastructure approver to your own authorized account.
+
+### Infrastructure pipeline
+
+`pipelines/infrastructure.yml` is manually triggered. It always formats/checks, initializes, validates and produces a saved plan. The default `apply` parameter is false. To apply, start a run with `apply` enabled, review that run's `tfplan/plan.txt` and cost, and explicitly approve its manual validation. Only that saved plan is applied; a changed state can invalidate it. Rerun the plan when infrastructure changes or drift must be examined. Terraform itself never applies automatically as part of application deployment.
+
+Set these Azure DevOps pipeline variables before running:
+
+| Variable | Value |
+| --- | --- |
+| `INFRA_SERVICE_CONNECTION` | Name of the federated infrastructure service connection |
+| `LOCATION`, `NAME_PREFIX` | Azure region such as `eastus`; globally unique lowercase alphanumeric prefix of 3-12 characters |
+| `DEPLOYMENT_PRINCIPAL_ID` | Object ID of the application service connection's service principal, not its client ID |
+| `STATE_RESOURCE_GROUP`, `STATE_STORAGE_ACCOUNT`, `STATE_CONTAINER`, `STATE_KEY` | Existing state backend resource group, account, private container and unique state blob name |
+| `BUDGET_AMOUNT`, `BUDGET_START_DATE`, `BUDGET_ALERT_EMAIL` | Monthly amount in subscription billing currency, stable first day of a month such as `2026-11-01T00:00:00Z`, and alert recipient |
+| `TF_APPROVERS` | Azure DevOps user or group authorized to approve applies |
+
+The pipeline publishes `infrastructure-outputs/outputs.json` after an approved apply. Copy its non-secret values to the application pipeline variables below. Keep the Terraform state and lock file; do not delete the state backend while resources are managed by it.
+
+### Application pipeline and public endpoint
+
+`pipelines/application.yml` builds and tests the solution and the manifest renderer, builds and smoke-tests the image locally on the agent, pushes a build-tagged image to ACR, and deploys to AKS. It never runs Terraform. Configure its variables and enable it only after infrastructure has been applied:
+
+| Variable | Value |
+| --- | --- |
+| `APP_SERVICE_CONNECTION` | Name of the separate application deployment service connection |
+| `RESOURCE_GROUP`, `AKS_NAME`, `ACR_NAME` | Terraform outputs `resource_group_name`, `cluster_name`, `registry_name` |
+| `K8S_NAMESPACE`, `SERVICE_ACCOUNT` | Terraform outputs `kubernetes_namespace`, `service_account_name`; must match the federated identity |
+| `WORKLOAD_IDENTITY_CLIENT_ID` | Terraform output `workload_identity_client_id` |
+| `SERVICE_BUS_NAMESPACE`, `SERVICE_BUS_TOPIC` | Terraform outputs `service_bus_namespace`, `service_bus_topic` |
+| `ENTRA_TENANT_ID` | Terraform output `tenant_id` |
+| `ENTRA_API_CLIENT_ID` | Client ID of the Entra **API** registration, not the workload identity |
+| `DNS_LABEL`, `PUBLIC_HOST` | Unique Azure public-IP DNS label and its expected FQDN, e.g. `eventtest` and `eventtest.eastus.cloudapp.azure.com`; verify the region's DNS suffix |
+| `ACME_EMAIL` | Contact email for the public TLS certificate issuer |
+
+The LoadBalancer service creates a public IP with the DNS label. A single pinned Caddy sidecar obtains and renews a public certificate over ports 80/443 and terminates HTTPS; its certificate data is stored on a persistent Azure disk. The API listens on port 8080 inside the pod. HTTPS redirection is disabled **only behind this TLS proxy**; do not expose the API's port directly. Public health endpoints are intentional for test verification. This minimal setup has no WAF or rate limiting, one replica and potential downtime during updates; do not treat it as a production ingress architecture. First-time DNS, role propagation and certificate issuance can take time; the deployment checks rollout and the public HTTPS liveness endpoint.
+
+Use a client-issued Entra v2 access token for this API with the `Event.Ingest` delegated scope or app role. Send it as a bearer token to `https://<PUBLIC_HOST>/api/events`; omit `tenantId` or supply the configured Entra tenant ID. A successful response is `202` only after broker publication. The test subscription allows a separately authorized receiver to verify the event; no receiver is deployed by this project. Grant the receiver `Azure Service Bus Data Receiver` separately.
+
+The Log Analytics agent collects cluster logs, but this alone does not export the application's OpenTelemetry traces and metrics. Configure an OTLP collector and `OTEL_EXPORTER_OTLP_ENDPOINT` separately if needed.
+
+To use a Key Vault secret later, first create the secret through an appropriately authorized secure workflow. Set `K8S_NAMESPACE`, `ENTRA_TENANT_ID`, `WORKLOAD_IDENTITY_CLIENT_ID`, `KEY_VAULT_NAME`, and `KEY_VAULT_SECRET_NAME`, then run `python scripts/RenderKubernetes.py --secret-provider-class` and apply the rendered manifest. Add a CSI volume referencing that SecretProviderClass to the workload before expecting the secret file to be mounted. No secret is needed for Service Bus authentication.
+
+After testing, review any Terraform destroy plan and obtain approval before removing resources. Removing the application service and persistent volume may also require deliberate Kubernetes cleanup. Preserve the state backend until managed resources are removed, then separately review cleanup of the bootstrap storage, subscriptions and app registrations.
 
 ## Broker adapter integration tests (opt-in)
 
@@ -282,8 +343,9 @@ Use a valid token accepted by the authentication scheme configured in your deplo
 
 ## Current limitations and future enhancements
 
-- Production authentication / JWT validation is not wired; the API currently requires a trusted authenticated principal with a `tenant_id` claim and fails closed otherwise.
+- Entra authentication is single-tenant and requires a separately configured API registration and authorized clients.
+- The Azure deployment below is a single-node, single-replica test environment, not a production availability design.
 - No application idempotency store, outbox, consumer, or dead-letter processing is included.
 - Kafka and Azure Event Grid are future extension points and have no placeholder implementations.
 - Broker integration tests require isolated broker resources and are skipped unless their environment configuration is present.
-- Future work may include production identity integration, richer broker readiness checks, idempotency/outbox support, CI workflows, and optional sustained-load profiles.
+- Future work may include richer broker readiness checks, idempotency/outbox support, and optional sustained-load profiles.

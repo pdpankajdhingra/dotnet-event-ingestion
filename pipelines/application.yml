@@ -1,0 +1,76 @@
+trigger:
+  paths:
+    include:
+      - src/*
+      - tests/*
+      - k8s/*
+      - scripts/RenderKubernetes.py
+      - Dockerfile
+      - Directory.Packages.props
+      - pipelines/application.yml
+pr: none
+
+pool:
+  vmImage: ubuntu-latest
+
+steps:
+  - checkout: self
+  - task: UseDotNet@2
+    inputs:
+      packageType: sdk
+      version: 10.0.x
+  - script: dotnet test EventIngestion.sln --configuration Release
+    displayName: Build and test
+  - script: python3 -m unittest discover -s tests -p test_*.py
+    displayName: Test manifest rendering
+  - task: AzureCLI@2
+    displayName: Build, smoke test, publish and deploy
+    inputs:
+      azureSubscription: $(APP_SERVICE_CONNECTION)
+      scriptType: bash
+      scriptLocation: inlineScript
+      inlineScript: |
+        set -euo pipefail
+        command -v docker >/dev/null
+        mkdir -p "$AGENT_TEMPDIRECTORY/aks-tools"
+        kubernetes_version="$(az aks show --resource-group "$RESOURCE_GROUP" --name "$AKS_NAME" --query kubernetesVersion -o tsv)"
+        az aks install-cli --client-version "v${kubernetes_version}" --kubelogin-version v0.2.16 \
+          --install-location "$AGENT_TEMPDIRECTORY/aks-tools/kubectl" \
+          --kubelogin-install-location "$AGENT_TEMPDIRECTORY/aks-tools/kubelogin"
+        export PATH="$AGENT_TEMPDIRECTORY/aks-tools:$PATH"
+        export IMAGE="${ACR_NAME}.azurecr.io/event-ingestion:${BUILD_ID}"
+        docker build -t "$IMAGE" .
+        container="event-ingestion-smoke-${BUILD_ID}"
+        trap 'docker rm -f "$container" >/dev/null 2>&1 || true' EXIT
+        docker run -d --name "$container" -p 127.0.0.1:18080:8080 \
+          -e Messaging__RabbitMQ__UserName=test -e Messaging__RabbitMQ__Password=test "$IMAGE" >/dev/null
+        for attempt in $(seq 1 30); do
+          if curl --silent --fail http://127.0.0.1:18080/health/live >/dev/null; then break; fi
+          if [ "$attempt" = 30 ]; then docker logs "$container"; exit 1; fi
+          sleep 2
+        done
+        az acr login --name "$ACR_NAME"
+        docker push "$IMAGE"
+        az aks get-credentials --resource-group "$RESOURCE_GROUP" --name "$AKS_NAME" --format exec --overwrite-existing
+        kubelogin convert-kubeconfig -l azurecli
+        python3 scripts/RenderKubernetes.py > "$RENDERED_MANIFEST"
+        kubectl create namespace "$K8S_NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
+        kubectl apply -f "$RENDERED_MANIFEST"
+        kubectl -n "$K8S_NAMESPACE" rollout status deployment/event-ingestion --timeout=10m
+        curl --fail --silent --show-error --retry 30 --retry-delay 10 --retry-all-errors "https://${PUBLIC_HOST}/health/live"
+    env:
+      ACR_NAME: $(ACR_NAME)
+      BUILD_ID: $(Build.BuildId)
+      RESOURCE_GROUP: $(RESOURCE_GROUP)
+      AKS_NAME: $(AKS_NAME)
+      K8S_NAMESPACE: $(K8S_NAMESPACE)
+      SERVICE_ACCOUNT: $(SERVICE_ACCOUNT)
+      WORKLOAD_IDENTITY_CLIENT_ID: $(WORKLOAD_IDENTITY_CLIENT_ID)
+      SERVICE_BUS_NAMESPACE: $(SERVICE_BUS_NAMESPACE)
+      SERVICE_BUS_TOPIC: $(SERVICE_BUS_TOPIC)
+      ENTRA_TENANT_ID: $(ENTRA_TENANT_ID)
+      ENTRA_API_CLIENT_ID: $(ENTRA_API_CLIENT_ID)
+      DNS_LABEL: $(DNS_LABEL)
+      PUBLIC_HOST: $(PUBLIC_HOST)
+      ACME_EMAIL: $(ACME_EMAIL)
+      RENDERED_MANIFEST: $(Agent.TempDirectory)/event-ingestion.yaml

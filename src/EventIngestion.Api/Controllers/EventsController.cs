@@ -1,6 +1,6 @@
 using System.Diagnostics;
 using System.Security.Claims;
-using EventIngestion.Application.Events;
+using EventIngestion.Application.Abstractions;
 using EventIngestion.Domain.Events;
 using Microsoft.AspNetCore.Mvc;
 
@@ -9,7 +9,7 @@ namespace EventIngestion.Api.Controllers;
 [ApiController]
 [Route("api/events")]
 public sealed class EventsController(
-    IngestEventHandler ingestEventHandler,
+    IEventAcceptance eventAcceptance,
     ILogger<EventsController> logger) : ControllerBase
 {
     private const string TenantClaimType = "tenant_id";
@@ -20,6 +20,7 @@ public sealed class EventsController(
     [ProducesResponseType<ValidationProblemDetails>(StatusCodes.Status400BadRequest)]
     [ProducesResponseType(StatusCodes.Status401Unauthorized)]
     [ProducesResponseType(StatusCodes.Status403Forbidden)]
+    [ProducesResponseType<ProblemDetails>(StatusCodes.Status409Conflict)]
     public async Task<IActionResult> IngestAsync(
         [FromBody] EventEnvelope message,
         CancellationToken cancellationToken)
@@ -52,6 +53,11 @@ public sealed class EventsController(
             validationErrors[nameof(message.Payload)] = ["Payload is required."];
         }
 
+        if (eventAcceptance.RequiresMessageId && string.IsNullOrWhiteSpace(message.MessageId))
+        {
+            validationErrors[nameof(message.MessageId)] = ["MessageId is required for durable acceptance."];
+        }
+
         if (validationErrors.Count > 0)
         {
             foreach (var (field, errors) in validationErrors)
@@ -74,9 +80,10 @@ public sealed class EventsController(
             OccurredAtUtc = message.OccurredAtUtc?.ToUniversalTime() ?? DateTimeOffset.UtcNow
         };
 
+        AcceptanceReceipt? receipt;
         try
         {
-            await ingestEventHandler.HandleAsync(eventToPublish, cancellationToken);
+            receipt = await eventAcceptance.AcceptAsync(eventToPublish, message.OccurredAtUtc, cancellationToken);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
@@ -86,20 +93,30 @@ public sealed class EventsController(
         {
             logger.LogError(
                 exception,
-                "Failed to publish event {MessageId} for tenant {TenantId}",
+                "Failed to accept event {MessageId} for tenant {TenantId}",
                 eventToPublish.MessageId,
                 eventToPublish.TenantId);
             throw;
         }
 
+        if (receipt is null)
+        {
+            return Conflict(new ProblemDetails
+            {
+                Status = StatusCodes.Status409Conflict,
+                Title = "MessageId is already associated with a different event."
+            });
+        }
+
         logger.LogInformation(
-            "Published event {MessageId} ({EventName}) for tenant {TenantId} with correlation {CorrelationId}",
-            eventToPublish.MessageId,
+            "Accepted event {MessageId} ({EventName}) for tenant {TenantId} with correlation {CorrelationId}; acceptance {Acceptance}",
+            receipt.MessageId,
             eventToPublish.EventName,
             eventToPublish.TenantId,
-            eventToPublish.CorrelationId);
+            receipt.CorrelationId,
+            receipt.Acceptance);
 
-        return Accepted(new IngestEventResponse(eventToPublish.MessageId!, eventToPublish.CorrelationId!));
+        return Accepted(new IngestEventResponse(receipt.MessageId, receipt.CorrelationId, receipt.Acceptance));
     }
 
     private string GetCorrelationId()
@@ -114,4 +131,4 @@ public sealed class EventsController(
     }
 }
 
-public sealed record IngestEventResponse(string MessageId, string CorrelationId);
+public sealed record IngestEventResponse(string MessageId, string CorrelationId, string Acceptance);

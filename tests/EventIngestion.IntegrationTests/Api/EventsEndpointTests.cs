@@ -71,6 +71,7 @@ public sealed class EventsEndpointTests : IDisposable
         Assert.NotNull(responseBody);
         Assert.False(string.IsNullOrWhiteSpace(responseBody.MessageId));
         Assert.Equal("correlation-42", responseBody.CorrelationId);
+        Assert.Equal("published", responseBody.Acceptance);
 
         var published = Assert.Single(_factory.Publisher.PublishedMessages);
         Assert.Equal(responseBody.MessageId, published.MessageId);

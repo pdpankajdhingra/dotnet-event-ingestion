@@ -20,8 +20,8 @@ EventIngestion.Api  --->  EventIngestion.Application  --->  IEventPublisher
 Dependency rules:
 
 - **Domain** has no project dependencies. It owns the `EventEnvelope` contract.
-- **Application** depends on Domain and defines `IEventPublisher` and `IngestEventHandler`. It has no broker SDK references.
-- **Infrastructure** depends on Application and Domain and contains provider-specific adapters and registration.
+- **Application** depends on Domain and defines `IEventPublisher`, `IEventAcceptance`, and `IngestEventHandler`. It has no broker SDK references.
+- **Infrastructure** depends on Application and Domain and contains provider-specific adapters, the optional PostgreSQL outbox, and registration.
 - **API** is the composition root and depends on Application and Infrastructure.
 
 ```text
@@ -38,6 +38,8 @@ scripts/
 ```
 
 ### Ingestion flow
+
+The default direct-publish flow is shown below. In optional outbox mode, the API stores the event in PostgreSQL and returns first; a background worker subsequently publishes it.
 
 ```mermaid
 sequenceDiagram
@@ -62,6 +64,7 @@ sequenceDiagram
 - .NET 10 SDK
 - Docker Desktop / Docker Engine with Docker Compose (for local RabbitMQ)
 - Azure namespace and data-plane sender permissions only when using Azure Service Bus
+- PostgreSQL, separately provisioned, only when enabling durable acceptance
 
 ## Build and test
 
@@ -185,16 +188,37 @@ The endpoint is `POST /api/events`. Example envelope:
 }
 ```
 
-`messageId` and `occurredAtUtc` are generated when omitted. Tenant identity is taken from the authenticated `tenant_id` claim; an absent or conflicting request tenant is rejected. Do not put bearer tokens or other credentials in event payloads.
+In direct mode, `messageId` and `occurredAtUtc` are generated when omitted. Durable mode requires a client-generated, stable `messageId`; `occurredAtUtc` may still be omitted. Tenant identity is taken from the authenticated `tenant_id` claim; an absent or conflicting request tenant is rejected. Do not put bearer tokens or other credentials in event payloads.
 
-On completion of the selected adapter's send operation, the API returns `202 Accepted` with a receipt:
+The API returns `202 Accepted` with a receipt:
 
 ```json
 {
   "messageId": "generated-or-supplied-id",
-  "correlationId": "request-456"
+  "correlationId": "request-456",
+  "acceptance": "published"
 }
 ```
+
+`acceptance` is `published` in direct mode, after the broker adapter's send completes, or `durable` in outbox mode, after PostgreSQL commits the event. Durable acceptance does not confirm broker publication or downstream processing.
+
+### Optional PostgreSQL durable acceptance
+
+Direct publishing remains the default. To enable the outbox, provision a PostgreSQL database separately and have a schema owner apply `infrastructure\postgres\001-outbox.sql` once using `psql` or your migration process. The application does not create or upgrade its schema. Grant the runtime identity `SELECT`, `INSERT`, and `UPDATE` on `event_ingestion_outbox`. Supply the connection string through a secure configuration mechanism; configure TLS and certificate verification for remote databases. For local configuration, set `Outbox__Enabled=true` and `ConnectionStrings__Outbox` to an Npgsql connection string in the process environment. Never commit credentials. Database availability, disk durability, backups, failover guarantees, encryption, and connection security are the operator's responsibility.
+
+The trusted tenant ID and client-provided `messageId` form the idempotency key. A repeat with the same event name, JSON payload (object property order is ignored), and supplied `occurredAtUtc` returns the original receipt, including its correlation ID. Correlation IDs are not part of event equality. Omitted timestamps compare as omitted, rather than against the server-generated timestamp. Reusing the key with different content returns `409 Conflict`. Clients must reuse the same ID and content after an uncertain response. Published records are retained indefinitely for deduplication; plan storage capacity and data retention before use. Deleting a record also ends its deduplication guarantee.
+
+A background worker locks pending rows with `FOR UPDATE SKIP LOCKED`, publishes to the configured broker, and marks them published. Failed sends are logged and retried after 30 seconds; there is no retry limit or dead-letter mechanism yet. A crash or uncertain outcome after broker acceptance can result in duplicate publication, so consumers must deduplicate. The worker holds a database transaction during each broker send. Monitor failures and pending rows; this design is not yet a high-throughput or high-availability guarantee.
+
+The supplied Terraform, Kubernetes manifests, and Azure DevOps pipelines **do not provision or configure PostgreSQL** and therefore continue to use direct mode. Enabling durable mode in Azure requires a separately secured database, schema deployment, and secret/configuration wiring; no Azure resources are created by this feature.
+
+To run the PostgreSQL integration tests, apply the schema to a dedicated disposable test database, then set `EVENTING_POSTGRES_TEST_CONNECTION` to its Npgsql connection string and run:
+
+```powershell
+dotnet test tests\EventIngestion.IntegrationTests\EventIngestion.IntegrationTests.csproj --filter FullyQualifiedName~PostgresOutboxTests
+```
+
+The tests insert and remove uniquely identified rows and dispatch pending rows; never point them at a shared or production database.
 
 ### Single-tenant Microsoft Entra authentication
 
@@ -205,11 +229,11 @@ The API validates the token signature, v2 issuer, audience, lifetime, tenant (`t
 ## Health, tracing, and metrics
 
 - `GET /health/live` reports API process liveness and does not probe the broker.
-- `GET /health/ready` includes the selected broker health check, with a five-second timeout.
+- `GET /health/ready` checks the broker in direct mode, or PostgreSQL connectivity and expected outbox columns in durable mode, with a five-second timeout. The outbox check does not verify write permissions or broker availability.
 - OpenTelemetry captures ASP.NET Core traces and runtime metrics. The messaging instrumentation emits a producer span, `eventing.publish.successes`, `eventing.publish.failures`, and `eventing.publish.duration`.
 - Set `OTEL_EXPORTER_OTLP_ENDPOINT` to enable OTLP export. Without it, the application runs without an OTLP exporter.
 
-The readiness probe creates/checks provider resources without sending an event. Health endpoints should be restricted or handled according to the hosting environment's network and information-disclosure policy.
+The direct-mode readiness probe creates/checks provider resources without sending an event. Health endpoints should be restricted or handled according to the hosting environment's network and information-disclosure policy.
 
 ## Azure test deployment
 
@@ -260,7 +284,7 @@ The pipeline publishes `infrastructure-outputs/outputs.json` after an approved a
 
 The LoadBalancer service creates a public IP with the DNS label. A single pinned Caddy sidecar obtains and renews a public certificate over ports 80/443 and terminates HTTPS; its certificate data is stored on a persistent Azure disk. The API listens on port 8080 inside the pod. HTTPS redirection is disabled **only behind this TLS proxy**; do not expose the API's port directly. Public health endpoints are intentional for test verification. This minimal setup has no WAF or rate limiting, one replica and potential downtime during updates; do not treat it as a production ingress architecture. First-time DNS, role propagation and certificate issuance can take time; the deployment checks rollout and the public HTTPS liveness endpoint.
 
-Use a client-issued Entra v2 access token for this API with the `Event.Ingest` delegated scope or app role. Send it as a bearer token to `https://<PUBLIC_HOST>/api/events`; omit `tenantId` or supply the configured Entra tenant ID. A successful response is `202` only after broker publication. The test subscription allows a separately authorized receiver to verify the event; no receiver is deployed by this project. Grant the receiver `Azure Service Bus Data Receiver` separately.
+Use a client-issued Entra v2 access token for this API with the `Event.Ingest` delegated scope or app role. Send it as a bearer token to `https://<PUBLIC_HOST>/api/events`; omit `tenantId` or supply the configured Entra tenant ID. The supplied Azure deployment uses direct mode, so it returns `202` after broker publication. The test subscription allows a separately authorized receiver to verify the event; no receiver is deployed by this project. Grant the receiver `Azure Service Bus Data Receiver` separately.
 
 The Log Analytics agent collects cluster logs, but this alone does not export the application's OpenTelemetry traces and metrics. Configure an OTLP collector and `OTEL_EXPORTER_OTLP_ENDPOINT` separately if needed.
 
@@ -332,20 +356,42 @@ The script exercises the HTTP API, not the broker. For example:
 
 Use a valid token accepted by the authentication scheme configured in your deployment. For local HTTPS development, trust the ASP.NET Core development certificate or use the API's HTTP URL.
 
-`Concurrency` bounds simultaneous requests. `BatchSize` bounds each request group before progress is reported. Warm-up requests run separately and are excluded from measured statistics. The script reports total measured wall-clock time, successful HTTP status responses, status-code counts, throughput (`measured request count / measured elapsed seconds`), and average/P95/P99 request latency. A publish-confirmed result requires the API's `202 Accepted` response and a receipt whose `messageId` and `correlationId` match that request. Other 2xx responses count as HTTP successes but do not confirm publishing. Any HTTP failure or unconfirmed publish makes the script exit nonzero.
+`Concurrency` bounds simultaneous requests. `BatchSize` bounds each request group before progress is reported. Warm-up requests run separately and are excluded from measured statistics. The script reports total measured wall-clock time, successful HTTP status responses, status-code counts, throughput (`measured request count / measured elapsed seconds`), and average/P95/P99 request latency. A matching receipt requires `202`, matching `messageId` and `correlationId`, and a recognized acceptance mode. Published and durable receipts are counted separately; durable receipts do not confirm publishing. Any HTTP failure or missing matching receipt makes the script exit nonzero.
 
 ## Reliability and delivery considerations
 
-- **Azure Service Bus:** the SDK retries transient send failures with exponential backoff; the send task completes when the service accepts the send. A timeout after broker acceptance can leave the caller uncertain, and retrying an event can create duplicates. Configure broker-side duplicate detection if appropriate, but this sample does not implement application idempotency.
+- **Azure Service Bus:** the SDK retries transient send failures with exponential backoff; the send task completes when the service accepts the send. A timeout after broker acceptance can leave the caller uncertain, and retrying an event can create duplicates. Configure broker-side duplicate detection if appropriate.
 - **RabbitMQ:** the adapter declares a durable exchange, publishes persistent messages, enables publisher-confirm tracking, and uses mandatory publishing. A successful publish task represents broker publisher confirmation/routing according to RabbitMQ.Client's confirm behavior; it does not prove a consumer processed the message. Durability also depends on queue type, broker persistence, and cluster configuration. A connection loss around confirmation can make the outcome ambiguous and lead to duplicates on retry.
-- Neither provider nor the API promises exactly-once delivery. Consumers should be idempotent and use `MessageId` where useful. Application-level idempotency and an outbox are future enhancements.
-- Provider acknowledgement is not equivalent to downstream business processing. `202` means the selected publish operation completed according to the adapter's broker acknowledgement semantics.
+- The optional PostgreSQL outbox deduplicates API acceptance but can publish duplicates after ambiguous outcomes. Direct mode has no application-level deduplication. Neither mode guarantees exactly-once delivery; consumers must be idempotent.
+- Provider acknowledgement is not equivalent to downstream processing. `202` means broker send completion in direct mode, or database acceptance in outbox mode.
 
-## Current limitations and future enhancements
+## Current limitations and potential improvements
 
-- Entra authentication is single-tenant and requires a separately configured API registration and authorized clients.
-- The Azure deployment below is a single-node, single-replica test environment, not a production availability design.
-- No application idempotency store, outbox, consumer, or dead-letter processing is included.
-- Kafka and Azure Event Grid are future extension points and have no placeholder implementations.
-- Broker integration tests require isolated broker resources and are skipped unless their environment configuration is present.
-- Future work may include richer broker readiness checks, idempotency/outbox support, and optional sustained-load profiles.
+These are current constraints and possible areas for future work, not commitments or production guarantees.
+
+### Reliability and delivery
+
+- PostgreSQL idempotency and outbox are opt-in and not configured in the Azure deployment. The outbox retries indefinitely and retains published rows indefinitely; automated retention, dead-letter handling, and backlog alerts are not implemented. There is no consumer or consumer-side deduplication.
+- Neither broker promises exactly-once delivery. Depending on the mode, `202 Accepted` confirms broker send completion or durable database acceptance, not downstream processing. See [Reliability and delivery considerations](#reliability-and-delivery-considerations).
+
+### Scalability and performance
+
+- No throughput or latency targets, capacity limits, or verified benchmark results are defined. The load-test script can measure behavior, but results depend on the environment and selected broker.
+- The service has no explicit bounded in-flight request limit or backpressure policy, autoscaling configuration, or application-level partitioning strategy. RabbitMQ publishing is serialized through a shared channel lock, which may limit throughput and should be measured before changing the design.
+
+### Security and tenant isolation
+
+- Entra authentication is single-tenant and requires a separately configured API registration and authorized clients. The Entra directory is treated as the event tenant; customer-level multi-tenant isolation is not implemented.
+- The Key Vault CSI integration is optional and is not mounted by default. The public test endpoint has no WAF or rate limiting. The application deployment identity has cluster-admin permissions for namespace creation; it should be restricted for a production deployment.
+
+### Operability and deployment
+
+- Tracing and metrics are instrumented, but OTLP export requires separate configuration. Application dashboards, operational alerts, and incident-response runbooks are not provided. The subscription budget alerts on cost, not application health.
+- The Azure configuration is a single-node, single-replica test environment with possible downtime during updates; it is not a high-availability design. The Azure resources, public TLS, workload identity, and Azure DevOps pipelines require end-to-end verification in the target subscription. Broker integration tests are opt-in and require isolated broker resources.
+- Kafka and Azure Event Grid are potential extension points; neither has an implementation. Richer readiness checks and sustained-load profiles are also potential improvements.
+
+### Engineering trade-offs
+
+- **Messaging:** Azure Service Bus is used for the Azure test deployment because it provides managed topics and integrates with managed identity; Standard tier adds a base charge. RabbitMQ provides an alternative for local or self-managed environments, but brings its own operational responsibilities and different acknowledgement semantics. The publisher abstraction avoids coupling application logic to either SDK; it does not make their delivery guarantees identical.
+- **Deployment:** AKS provides a Kubernetes-based deployment model and workload identity integration, but incurs infrastructure costs and operational complexity. The single-node configuration prioritizes a smaller test footprint over availability and is not intended as a production recommendation.
+- **Consistency:** Direct mode waits for broker acknowledgement but adds broker latency and can leave an ambiguous outcome. Outbox mode returns after PostgreSQL commits, decoupling intake from broker availability at the cost of database operations, storage, eventual publication, and possible duplicate delivery.

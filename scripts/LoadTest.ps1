@@ -68,7 +68,8 @@ namespace EventIngestion.LoadTest
 		public string MessageId { get; init; } = string.Empty;
 		public int? StatusCode { get; init; }
 		public bool HttpSuccess { get; init; }
-		public bool PublishConfirmed { get; init; }
+		public bool ReceiptConfirmed { get; init; }
+		public string? Acceptance { get; init; }
 		public double LatencyMilliseconds { get; init; }
 		public string? Failure { get; init; }
 	}
@@ -77,6 +78,7 @@ namespace EventIngestion.LoadTest
 	{
 		public string? MessageId { get; init; }
 		public string? CorrelationId { get; init; }
+		public string? Acceptance { get; init; }
 	}
 
 	public static class HttpLoadClient
@@ -99,7 +101,8 @@ namespace EventIngestion.LoadTest
 			var stopwatch = Stopwatch.StartNew();
 			int? statusCode = null;
 			var httpSuccess = false;
-			var publishConfirmed = false;
+			var receiptConfirmed = false;
+			string? acceptance = null;
 			string? failure = null;
 
 			try
@@ -137,12 +140,17 @@ namespace EventIngestion.LoadTest
 				{
 					var responseBody = await response.Content.ReadAsStringAsync(timeout.Token).ConfigureAwait(false);
 					var receipt = JsonSerializer.Deserialize<IngestReceipt>(responseBody, ReceiptOptions);
-					publishConfirmed = receipt is not null &&
+					receiptConfirmed = receipt is not null &&
 						string.Equals(receipt.MessageId, messageId, StringComparison.Ordinal) &&
-						string.Equals(receipt.CorrelationId, correlationId, StringComparison.Ordinal);
-					if (!publishConfirmed)
+						string.Equals(receipt.CorrelationId, correlationId, StringComparison.Ordinal) &&
+						(receipt.Acceptance == "published" || receipt.Acceptance == "durable");
+					if (receiptConfirmed)
 					{
-						failure = "HTTP 202 did not contain a matching messageId and correlationId receipt.";
+						acceptance = receipt!.Acceptance;
+					}
+					else
+					{
+						failure = "HTTP 202 did not contain a matching receipt with a recognized acceptance mode.";
 					}
 				}
 				else if (!httpSuccess)
@@ -172,7 +180,8 @@ namespace EventIngestion.LoadTest
 				MessageId = messageId,
 				StatusCode = statusCode,
 				HttpSuccess = httpSuccess,
-				PublishConfirmed = publishConfirmed,
+				ReceiptConfirmed = receiptConfirmed,
+				Acceptance = acceptance,
 				LatencyMilliseconds = stopwatch.Elapsed.TotalMilliseconds,
 				Failure = failure
 			};
@@ -235,8 +244,8 @@ try {
 		Write-Host "Running $WarmupCount warm-up request(s) with concurrency $Concurrency..."
 		$warmupResults = Invoke-RequestSet -RequestCount $WarmupCount -RequestOffset 0
 		$warmupHttpSuccesses = @($warmupResults | Where-Object HttpSuccess).Count
-		$warmupConfirmed = @($warmupResults | Where-Object PublishConfirmed).Count
-		Write-Host "Warm-up complete: HTTP successful $warmupHttpSuccesses/$WarmupCount; publish-confirmed $warmupConfirmed/$WarmupCount. Warm-up is excluded from measurements."
+		$warmupConfirmed = @($warmupResults | Where-Object ReceiptConfirmed).Count
+		Write-Host "Warm-up complete: HTTP successful $warmupHttpSuccesses/$WarmupCount; matching receipts $warmupConfirmed/$WarmupCount. Warm-up is excluded from measurements."
 	}
 
 	Write-Host "Running $Count measured request(s); concurrency $Concurrency, batch size $BatchSize..."
@@ -264,9 +273,11 @@ try {
 
 	$latencies = @($measuredResults | ForEach-Object LatencyMilliseconds | Sort-Object)
 	$httpSuccesses = @($measuredResults | Where-Object HttpSuccess).Count
-	$publishConfirmed = @($measuredResults | Where-Object PublishConfirmed).Count
+	$receiptConfirmed = @($measuredResults | Where-Object ReceiptConfirmed).Count
+	$published = @($measuredResults | Where-Object { $_.Acceptance -eq 'published' }).Count
+	$durable = @($measuredResults | Where-Object { $_.Acceptance -eq 'durable' }).Count
 	$httpFailures = @($measuredResults | Where-Object { -not $_.HttpSuccess }).Count
-	$unconfirmed = @($measuredResults | Where-Object { -not $_.PublishConfirmed }).Count
+	$unconfirmed = @($measuredResults | Where-Object { -not $_.ReceiptConfirmed }).Count
 	$elapsedSeconds = $measuredStopwatch.Elapsed.TotalSeconds
 	$throughput = if ($elapsedSeconds -gt 0) { $Count / $elapsedSeconds } else { 0 }
 	$averageLatency = if ($latencies.Count -gt 0) { ($latencies | Measure-Object -Average).Average } else { 0 }
@@ -294,8 +305,10 @@ try {
 	Write-Host ("Throughput:               {0:N2} requests/second" -f $throughput)
 	Write-Host ("HTTP successful (2xx):    {0}/{1}" -f $httpSuccesses, $Count)
 	Write-Host ("HTTP failed:              {0}/{1}" -f $httpFailures, $Count)
-	Write-Host ("Publish-confirmed:        {0}/{1}" -f $publishConfirmed, $Count)
-	Write-Host ("Not publish-confirmed:    {0}/{1}" -f $unconfirmed, $Count)
+	Write-Host ("Matching receipts:        {0}/{1}" -f $receiptConfirmed, $Count)
+	Write-Host ("Published receipts:       {0}/{1}" -f $published, $Count)
+	Write-Host ("Durable receipts:         {0}/{1}" -f $durable, $Count)
+	Write-Host ("Unconfirmed receipts:     {0}/{1}" -f $unconfirmed, $Count)
 	Write-Host ("Average latency:          {0:N2} ms" -f $averageLatency)
 	Write-Host ("P95 latency:              {0:N2} ms" -f (Get-Percentile -SortedValues $latencies -Percentile 0.95))
 	Write-Host ("P99 latency:              {0:N2} ms" -f (Get-Percentile -SortedValues $latencies -Percentile 0.99))
@@ -305,7 +318,7 @@ try {
 		Write-Host ("  {0}: {1}" -f $statusCount.Name, $statusCount.Count)
 	}
 
-	$failures = @($measuredResults | Where-Object { -not $_.HttpSuccess -or ($_.StatusCode -eq 202 -and -not $_.PublishConfirmed) })
+	$failures = @($measuredResults | Where-Object { -not $_.HttpSuccess -or ($_.StatusCode -eq 202 -and -not $_.ReceiptConfirmed) })
 	if ($failures.Count -gt 0) {
 		Write-Host ''
 		Write-Host "Failures (showing up to 20 of $($failures.Count)) :" -ForegroundColor Yellow
@@ -316,11 +329,11 @@ try {
 
 	if ($unconfirmed -gt 0) {
 		Write-Host ''
-		Write-Host 'A publish-confirmed result requires HTTP 202 and a response receipt matching the request messageId and correlationId.'
-		Write-Host 'Other 2xx responses count as HTTP successes, but do not confirm publishing.'
+		Write-Host 'A matching receipt requires HTTP 202, matching IDs, and a recognized acceptance mode.'
+		Write-Host 'Durable acceptance does not confirm broker publication; other 2xx responses are not matching receipts.'
 	}
 
-	if ($httpFailures -gt 0 -or $publishConfirmed -lt $Count) {
+	if ($httpFailures -gt 0 -or $receiptConfirmed -lt $Count) {
 		exit 1
 	}
 }

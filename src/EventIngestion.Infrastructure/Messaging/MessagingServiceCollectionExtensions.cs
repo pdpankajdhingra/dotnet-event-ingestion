@@ -22,6 +22,7 @@ public static class MessagingServiceCollectionExtensions
         {
             throw new InvalidOperationException($"Configuration value '{ProviderConfigurationKey}' is required.");
         }
+        var readinessTags = configuration.GetValue<bool>("Outbox:Enabled") ? Array.Empty<string>() : ["ready"];
 
         switch (provider.Trim().ToUpperInvariant())
         {
@@ -42,7 +43,7 @@ public static class MessagingServiceCollectionExtensions
                     serviceProvider.GetRequiredService<InstrumentedEventPublisher>());
                 services.AddHealthChecks().AddCheck<MessagingHealthCheck>(
                     "messaging",
-                    tags: ["ready"],
+                    tags: readinessTags,
                     timeout: TimeSpan.FromSeconds(5));
                 break;
 
@@ -63,7 +64,7 @@ public static class MessagingServiceCollectionExtensions
                     serviceProvider.GetRequiredService<InstrumentedEventPublisher>());
                 services.AddHealthChecks().AddCheck<MessagingHealthCheck>(
                     "messaging",
-                    tags: ["ready"],
+                    tags: readinessTags,
                     timeout: TimeSpan.FromSeconds(5));
                 break;
 

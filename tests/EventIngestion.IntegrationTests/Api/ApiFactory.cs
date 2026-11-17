@@ -15,7 +15,7 @@ using Microsoft.Extensions.Options;
 
 namespace EventIngestion.IntegrationTests.Api;
 
-public sealed class ApiFactory : WebApplicationFactory<Program>
+public sealed class ApiFactory(string? outboxConnectionString = null) : WebApplicationFactory<Program>
 {
     public RecordingEventPublisher Publisher { get; } = new();
 
@@ -28,7 +28,9 @@ public sealed class ApiFactory : WebApplicationFactory<Program>
             {
                 ["Messaging:Provider"] = "RabbitMQ",
                 ["Messaging:RabbitMQ:UserName"] = "test-user",
-                ["Messaging:RabbitMQ:Password"] = "test-password"
+                ["Messaging:RabbitMQ:Password"] = "test-password",
+                ["Outbox:Enabled"] = (outboxConnectionString is not null).ToString(),
+                ["ConnectionStrings:Outbox"] = outboxConnectionString
             }));
 
         builder.ConfigureTestServices(services =>

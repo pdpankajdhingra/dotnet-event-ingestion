@@ -1,6 +1,7 @@
 using EventIngestion.Api.Authentication;
 using EventIngestion.Application.Events;
 using EventIngestion.Infrastructure.Messaging;
+using EventIngestion.Api.Outbox;
 using Microsoft.AspNetCore.Diagnostics.HealthChecks;
 using Microsoft.Extensions.Diagnostics.HealthChecks;
 using OpenTelemetry.Metrics;
@@ -17,6 +18,7 @@ builder.Services.AddMessaging(builder.Configuration);
 builder.Services.AddHealthChecks()
     .AddCheck("self", () => HealthCheckResult.Healthy(), tags: ["live", "ready"]);
 builder.Services.AddScoped<IngestEventHandler>();
+builder.Services.AddEventAcceptance(builder.Configuration);
 
 var otlpEndpoint = builder.Configuration["OTEL_EXPORTER_OTLP_ENDPOINT"];
 builder.Services.AddOpenTelemetry()
